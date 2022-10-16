@@ -1,0 +1,195 @@
+---
+title: "xEV90"
+author: "Bradley Buchner"
+date: "10/16/2022"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(readr)
+library(readxl)
+library(dplyr)
+library(caret)
+library(modelr)
+library(broom)
+library(ggpmisc)
+
+DATA <- read_xlsx("~/Desktop/PD Investigation/Data/HitDev Master.xlsx")
+
+DATA2 <- DATA %>% filter(between(`BJ Power[W/Kg]`, 17.5, 27.5))
+DATA2 <- DATA2 %>% rename(
+  "BJP" = "BJ Power[W/Kg]",
+  "EV90" = "EV 90th percentile",
+  "tot30" = "30 Total",
+  "green_box" =  "Green Box",
+  "green3" =  "Green 3", 
+  "agility_diff" = "Agility Diff", 
+  "good_angle" = "Good Angle %", 
+  "middle_pct" = "Middle %",
+  "reaction" = "Reaction to Go (sec)",
+  "CMJP" = "CMJ Power [W/Kg]"
+  
+) %>% filter(!(is.na(BJP)), !(is.na(EV90)), !(is.na(CMJP))) %>%
+  mutate(
+    max_grip = pmax(`LEFT DOWN`, `LEFT 90`, `LEFT UP`, `RIGHT DOWN`, `RIGHT 90`, `RIGHT UP`),
+    `max_grip/wt` = max_grip/Weight
+  )
+```
+
+```{r}
+require(Boruta)
+set.seed(323)
+boruta_nnet = Boruta(EV90 ~ BJP+CMJP+reaction+max_grip+agility_diff+Hawkeye+green3,
+                  data = DATA2[, c("EV90", "BJP", "CMJP", "reaction", "green3", "Hawkeye", "agility_diff", "max_grip"), drop = F] %>% na.omit())
+plot(boruta_nnet)
+print(boruta_nnet)
+```
+
+```{r}
+
+require(ggthemes)
+ggplot(DATA2, aes(x = BJP, y = CMJP, color = EV90)) +
+  geom_point(size = 8) + theme_fivethirtyeight() + ggtitle("Broad Jump Power (BJP) vs. Vertical Jump Power (CMJP) colored by EV90") + theme(axis.title.y = element_text(), axis.title.x = element_text()) + xlab("BJP") + ylab("CMJP") + scale_color_gradient2(midpoint=median(DATA2$EV90), low = "blue", high="green", mid="#40E0D0", space ="Lab")
+
+DATA_plot = DATA2
+ggplot(DATA_plot, aes(x = BJP, y = CMJP, z = EV90)) + 
+    stat_summary_hex(binwidth = c(.5, 4.1)) + theme_fivethirtyeight() + ggtitle("Broad Jump Power (BJP) vs. Vertical Jump Power (CMJP) colored by EV90") + theme(axis.title.y = element_text(), axis.title.x = element_text()) + xlab("BJP") + ylab("CMJP") +  
+    scale_fill_gradient2(name = "EV90", low = "green", mid = "#40E0D0", high = "blue", 
+                         midpoint = median(DATA_plot$EV90)) 
+```
+
+Created train and test datasets
+```{r}
+set.seed(444)
+DATA2$SPLIT = sample(x=c("TRAIN", "TEST"), size = 388,
+                    replace = T, prob = c(.85, .15))
+TRAIN = DATA2 %>% filter(SPLIT == "TRAIN")
+TEST = DATA2 %>% filter(SPLIT == "TEST")
+```
+
+## Neural Network
+```{r}
+## Create a specific candidate set of models to evaluate:
+trainNN_v2 = TRAIN[, c("EV90", "BJP", "CMJP", "max_grip"), drop = F] %>% na.omit()
+
+nnetGrid <- expand.grid(decay = c(0, 0.01, .1),
+              size = c(1:3))          
+
+set.seed(100)
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+nnetTune <- train(EV90 ~ BJP+CMJP+max_grip,
+                  data = trainNN_v2,
+                  method = "nnet",
+                  tuneGrid = nnetGrid,
+                  trControl = control,
+## Automatically standardize data prior to modeling
+                  ## and prediction
+preProc = c("center", "scale"),
+                  linout = TRUE,
+                  trace = FALSE,
+MaxNWts = 10 * (3 + 1) + 10 + 1,
+maxit = 500)
+
+min(nnetTune$results$RMSE)
+
+```
+
+## Averaged Neural Networks
+```{r}
+
+nnetGrid <- expand.grid(decay = c(0, 0.01, .1),
+              size = c(1:3),
+              bag = T)          
+
+set.seed(100)
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+nnetTune <- train(EV90 ~ BJP+CMJP+max_grip,
+                  data = trainNN_v2,
+                  method = "avNNet",
+                  tuneGrid = nnetGrid,
+                  trControl = control,
+## Automatically standardize data prior to modeling
+                  ## and prediction
+preProc = c("center", "scale"),
+                  linout = TRUE,
+                  trace = FALSE,
+MaxNWts = 10 * (3 + 1) + 10 + 1,
+maxit = 500)
+
+min(nnetTune$results$RMSE)
+
+# testNN$preds = predict(nnetTune, testNN)         
+```
+
+## Random Forest
+```{r}
+trainRF = TRAIN[, c("EV90", "BJP", "CMJP", "max_grip"), drop = F] %>% na.omit()
+testRF = TEST[, c("EV90", "BJP", "CMJP", "max_grip"), drop = F] %>% na.omit()
+
+rfGrid <- expand.grid(mtry = 1:3)          
+set.seed(122)
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+rfTune <- train(EV90 ~ BJP+CMJP+max_grip,
+                  data = trainRF,
+                  method = "rf",
+                  tuneGrid = rfGrid,
+                  trControl = control)
+
+min(rfTune$results$RMSE)
+
+# plot(rfTune$finalModel)
+```
+
+Create Predictions
+```{r}
+testRF$xEV90 <- round(predict(rfTune, testRF), 1)
+testRF = testRF %>% mutate(
+  `xEV90-EV90` = xEV90 - EV90
+) %>% arrange(desc(EV90))
+```
+
+```{r}
+rmse_tbl = data.frame(RMSE = NA)
+rmse_tbl[1,1] = round(min(nnetTune$results$RMSE), 2)
+rmse_tbl[2,1] = round(min(rfTune$results$RMSE), 2)
+
+rownames(rmse_tbl) <- c("Neural Network", "Random Forest")
+rmse_tbl %>%
+  kbl() %>%
+  kable_styling(full_width = F) %>%
+  column_spec(1, bold = T, color = "black")  %>%
+  column_spec(2, bold = T, background = ifelse(rmse_tbl[,1] == 3.94, "yellow", "white"), color = "black")
+```
+
+# Visualize Predictions
+```{r}
+require(ggthemes)
+ggplot(testRF, aes(x = EV90, y = xEV90, color = `xEV90-EV90`))  + geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dashed") +
+  geom_point(size = 8) + theme_fivethirtyeight() + ggtitle("EV90 vs. xEV90 colored by xEV90 - EV90") + theme(axis.title.y = element_text(), axis.title.x = element_text()) + xlab("Actual EV90") + ylab("xEV90") + scale_color_gradient2(midpoint=median(testRF$`xEV90-EV90`), low = "blue", high="green", mid="#40E0D0", space ="Lab")  + ylim(80, 105)
+
+ggplot(testRF, aes(x = BJP, y = CMJP, color = xEV90)) +
+  geom_point(size = 8) + theme_fivethirtyeight() + ggtitle("Broad Jump Power (BJP) vs. Vertical Jump Power (CMJP) colored by xEV90") + theme(axis.title.y = element_text(), axis.title.x = element_text(), plot.subtitle = element_text("colored by xEV90")) + ylab("CMJP") + xlab("BJP") + scale_color_gradient2(midpoint=mean(testRF$xEV90), low = "green", high="blue", mid="#40E0D0", space ="Lab")
+
+```
+
+## xEV90-EV90 Analysis
+```{r}
+PlayerA = testRF[22,]
+PlayerB = testRF[21,]
+
+PlayersAB = bind_rows(PlayerA, PlayerB)
+
+require(kableExtra)
+tbl = as.data.frame(PlayersAB[,c(1, 5, 6)])
+rownames(tbl) <- c("Player A", "Player B")
+tbl %>%
+  kbl() %>%
+  kable_styling(full_width = F) %>%
+  column_spec(1, bold = T, color = "black")  %>%
+  column_spec(4, bold = T, background = ifelse(tbl[,3] > 0, "#00FF00", "#0000FF"), color = ifelse(tbl[,3] > 0, "black", "white"))
+
+ggplot(testRF, aes(x = EV90, y = xEV90, color = `xEV90-EV90`))  + geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dashed") +
+  geom_point(size = 8) + 
+  geom_text(aes(label=ifelse(xEV90 == 97.8, "Player A", ifelse(xEV90 == 90.6, "Player B", ""))), hjust=.5, vjust=-.3, color = "black") + theme_fivethirtyeight() + ggtitle("EV90 vs. xEV90 colored by xEV90 - EV90") + theme(axis.title.y = element_text(), axis.title.x = element_text()) + xlab("Actual EV90") + ylab("xEV90") + scale_color_gradient2(midpoint=median(testRF$`xEV90-EV90`), low = "blue", high="green", mid="#40E0D0", space ="Lab")  + ylim(80, 105)
+```
